@@ -9,22 +9,21 @@
   Protocol decoding by "redgreen" https://github.com/merbanan/rtl_433
     via Stewart Russell's blog http://scruss.com/
   Additional work and porting to ATmega by Bryan Mayland
+  
+  Additional work by E.Lafargue for easier computer parsing, on-board settings save
+  
 */
 #include <util/atomic.h>
 #include "rf69_ook.h"
 #include "temp_lerp.h"
+#include "pm_config.h"
 
-//#define DPIN_OOK_TX         3
-#define DPIN_STARTTX_BUTTON 6
-#define DPIN_RF69_RESET     7
-#define DPIN_OOK_RX         8
-#define DPIN_LED            9
+// Define two set/clear macros to do PIN manipulation
+// way way faster than Arduino's digitalWrite.
+#define setpin(port, pin) (port) |= (1 << (pin)) 
+#define clearpin(port, pin) (port) &= ~(1 << (pin))
+#define togglepin(port, pin) (port) ^= (1 << (pin))
 
-// The default ID of the transmitter to decode/encode from/to
-#define DEFAULT_TX_ID 0xfdcc
-
-// If defined will dump all the encoded RX data, and partial decode fails
-//#define DUMP_RX
 
 static uint16_t g_TxId;
 static uint8_t g_TxCnt;
@@ -36,7 +35,16 @@ static uint8_t g_TxLowBat;
 static uint16_t g_TxWatts;
 static uint16_t g_TxTotal;
 
-static char g_SerialBuff[40];
+// Various buffers to build strings:
+#define INPUT_BUFFER_SIZE 50
+static char input_buffer[INPUT_BUFFER_SIZE];
+static char output_buffer[INPUT_BUFFER_SIZE];
+static char float_buffer[16];
+uint8_t input_buffer_index;
+
+// Our settings (saved to EEPROM)
+settings_t settings;
+
 
 static struct tagWireVal
 {
@@ -329,52 +337,53 @@ static void resetRf69(void)
 
 static void handleCommand(void)
 {
-  switch (g_SerialBuff[0])
+  
+  switch (input_buffer[0])
   {
   case 'b':
     Serial.print(F("Batt"));
-    if (g_SerialBuff[1] != '?')
-      g_TxLowBat = atoi(&g_SerialBuff[1]);
+    if (input_buffer[1] != '?')
+      g_TxLowBat = atoi(&input_buffer[1]);
     Serial.println(g_TxLowBat, DEC);
     g_TxCnt = 4; // force next packet is temperature
     break;
   case 'f':
     Serial.print(F("Flags"));
-    if (g_SerialBuff[1] != '?')
-      g_TxFlags = atoi(&g_SerialBuff[1]);
+    if (input_buffer[1] != '?')
+      g_TxFlags = atoi(&input_buffer[1]);
     Serial.println(g_TxFlags, DEC);
     g_TxCnt = 4; // force next packet is temperature
     break;
   case 'k':
     Serial.print(F("TotalkW"));
-    if (g_SerialBuff[1] != '?')
-      g_TxTotal = atoi(&g_SerialBuff[1]);
+    if (input_buffer[1] != '?')
+      g_TxTotal = atoi(&input_buffer[1]);
     Serial.println(g_TxTotal, DEC);
     g_TxCnt = 5; // force next packet is total
     break;
   case 'q':
     Serial.print(F("freQ"));
-    setRF69Freq(&g_SerialBuff[1]);
+    setRF69Freq(&input_buffer[1]);
     break;
   case 't':
     Serial.print(F("Temp"));
-    if (g_SerialBuff[1] != '?')
-      g_TxTemperature = atoi(&g_SerialBuff[1]);
+    if (input_buffer[1] != '?')
+      g_TxTemperature = atoi(&input_buffer[1]);
     Serial.println(g_TxTemperature, DEC);
     g_TxCnt = 4; // force next packet is temperature
     break;
   case 'w':
     Serial.print(F("InstW"));
-    if (g_SerialBuff[1] != '?')
-      g_TxWatts = atoi(&g_SerialBuff[1]);
+    if (input_buffer[1] != '?')
+      g_TxWatts = atoi(&input_buffer[1]);
     Serial.println(g_TxWatts, DEC);
     g_TxCnt = 0; // force next packet is usage
     break;
   case 'x':
     Serial.print(F("TxId"));
-    if (g_SerialBuff[1] != '?')
-      g_TxId = atoi(&g_SerialBuff[1]);
-    Serial.println(g_TxId, DEC);
+    if (input_buffer[1] != '?')
+      settings.tx_id = atoi(&input_buffer[1]);
+    Serial.println(settings.tx_id, DEC);
     break;
   case 'z':
     rf69ook_dumpRegs();
@@ -394,25 +403,17 @@ static void handleCommand(void)
 
 static void serial_doWork(void)
 {
-  while (Serial.available())
-  {
-    unsigned char len = strlen(g_SerialBuff);
-    char c = Serial.read();
-    // support CR, LF, or CRLF line endings
-    if (c == '\n' || c == '\r')  
-    {
-      if (len != 0)
-        handleCommand();
-      len = 0;
-    }
-    else {
-      g_SerialBuff[len++] = c;
-      // if the buffer fills without getting a newline, just reset
-      if (len >= sizeof(g_SerialBuff))
-        len = 0;
-    }
-    g_SerialBuff[len] = '\0';
-  }  /* while Serial */
+  
+  // Check if we have serial input
+  while (Serial.available()) {
+    input_buffer[input_buffer_index] = Serial.read();
+    if (input_buffer[input_buffer_index] == '\n') {
+      input_buffer[input_buffer_index] = 0;
+      handleCommand();
+      input_buffer_index = 0;
+    } else 
+      input_buffer_index = (input_buffer_index+1)%INPUT_BUFFER_SIZE;
+  }
 }
 
 static void resetDecoder(void)
@@ -511,7 +512,7 @@ static void decodePowermon(uint16_t val16)
     break;
 
   case OOK_PACKET_TEMP:
-    g_RxTemperature = temp_lerp(decoder.data[1]);
+    g_RxTemperature = fudged_f_to_c(temp_lerp(decoder.data[1]));
     g_RxFlags = decoder.data[0];
     break;
 
@@ -547,7 +548,7 @@ static void decodeRxPacket(void)
   uint16_t val16 = *(uint16_t *)decoder.data;
   if (crc8(decoder.data, 3) == 0)
   {
-    g_TxId = decoder.data[1] << 8 | decoder.data[0];
+    settings.tx_id = decoder.data[1] << 8 | decoder.data[0];
     Serial.print(F("NEW DEVICE id="));
     Serial.print(val16, HEX);
     printRssi();
@@ -555,7 +556,7 @@ static void decodeRxPacket(void)
     return;
   }
 
-  val16 -= g_TxId;
+  val16 -= settings.tx_id;
   decoder.data[0] = val16 & 0xff;
   decoder.data[1] = val16 >> 8;
   if (crc8(decoder.data, 3) == 0)
@@ -604,7 +605,7 @@ static void ookTx(void)
   {
     for (uint8_t i=0; i<4; ++i)
     {
-      TxIdOnce(g_TxId);
+      TxIdOnce(settings.tx_id);
       delay(OOK_ID_DELAY);
     }
 
@@ -617,11 +618,11 @@ static void ookTx(void)
     for (uint8_t i=0; i<3; ++i)
     {
       if (i == 2 || (g_TxCnt >= 0 && g_TxCnt < 4))
-        TxInstantOnce(g_TxId, wattsToCnt(g_TxWatts));
+        TxInstantOnce(settings.tx_id, wattsToCnt(g_TxWatts));
       else if (g_TxCnt == 4)
-        TxTempOnce(g_TxId, g_TxTemperature, g_TxLowBat);
+        TxTempOnce(settings.tx_id, g_TxTemperature, g_TxLowBat);
       else if (g_TxCnt == 5)
-        TxTotalOnce(g_TxId, g_TxTotal);
+        TxTotalOnce(settings.tx_id, g_TxTotal);
       delay(OOK_TX_DELAY);
     }
 
@@ -656,22 +657,22 @@ static void ookRx(void)
   if (g_RxDirty && (millis() - g_RxLast) > 250U)
   {
  #if defined(DUMP_RX)
-   Serial.print('['); Serial.print(millis(), DEC); Serial.print(F("] "));
+   Serial.print("{ \"uptime\":"); Serial.print(millis(), DEC); Serial.print('}');
 #endif
-    Serial.print(F("Energy: ")); Serial.print(g_RxWattHours, DEC);
-    Serial.print(F(" Wh, Power: ")); Serial.print(g_RxWatts, DEC);
-    Serial.print(F(" W, Temp: ")); Serial.print(g_RxTemperature, DEC);
-    Serial.print(F(" F,"));
-    printRssi();
-    Serial.print(F(", LowBat: ")); Serial.println(g_RxFlags >> 7, DEC);
+    Serial.print(F("{ \"energy\": ")); Serial.print(g_RxWattHours, DEC);
+    Serial.print(F(", \"p_raw\": ")); Serial.print(g_RxWatts, DEC);
+    Serial.print(F(", \"power\": ")); Serial.print(g_RxWatts*settings.power_factor, DEC);
+    Serial.print(F(", \"temp\": ")); Serial.print(g_RxTemperature, DEC);
+    Serial.print(F(", \"lowbat\": ")); Serial.print(g_RxFlags >> 7, DEC);
+    Serial.println(F("}"));
 
     g_RxDirty = false;
   }
 
   else if ((millis() - g_RxLast) > 32000U)
   {
-    Serial.print('['); Serial.print(millis(), DEC); Serial.print(F("] Missed (floor "));
-    Serial.print(g_RxOokFloor, DEC); Serial.println(')');
+    Serial.print(F("{ \"missed_rx\":")); Serial.print(millis(), DEC); Serial.print(F(", \"floor\": "));
+    Serial.print(g_RxOokFloor, DEC); Serial.println('}');
     g_RxLast = millis();
     digitalWrite(DPIN_LED, LOW);
     resetDecoder();
@@ -700,9 +701,34 @@ static void ookRx(void)
 #endif // DPIN_OOK_RX
 }
 
+static void save_settings() {
+   eeprom_write_block((const void*)&settings, (void*)0, sizeof(settings));
+}
+
+/* Load Settings (using address zero in EEPROM) */
+static void load_settings() {
+   eeprom_read_block((void*)&settings, (void*)0, sizeof(settings));
+   
+   // Check whether we have a new board, if so, initialize settings to defaults and save right away
+   if (settings.magic != SETTINGS_MAGIC) {
+     settings.magic = SETTINGS_MAGIC;
+     settings.tx_id = DEFAULT_TX_ID;
+     settings.power_factor = 6;
+
+     save_settings();
+     
+    // Visual feedback that we initialized the settings: 10 blinks
+    for (int i=0; i < 20; i++) {
+      togglepin(PORTC,6);
+      delay(250);
+    }
+   }
+}
+
+
 void setup() {
-  Serial.begin(38400);
-  Serial.println(F("$UCID,Powermon433,"__DATE__" "__TIME__));
+  Serial.begin(115200);
+  Serial.println(F("{ \"version\": \"$UCID,Powermon433,"__DATE__" "__TIME__"\"}"));
 
   pinMode(DPIN_LED, OUTPUT);
   if (rf69ook_init())
@@ -714,7 +740,7 @@ void setup() {
   txSetup();
   rxSetup();
 
-  g_TxId = DEFAULT_TX_ID;
+  load_settings();
 }
 
 void loop()
