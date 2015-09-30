@@ -24,9 +24,20 @@
 #define clearpin(port, pin) (port) &= ~(1 << (pin))
 #define togglepin(port, pin) (port) ^= (1 << (pin))
 
-
-static uint16_t g_TxId;
 static uint8_t g_TxCnt;
+
+// Debug (not a define, because we want to be able to toggle output live)
+bool debug = 0;
+
+// Flag to attempt a TX_ID bruteforce
+bool txid_bruteforce = 0;
+uint8_t bf_idx = 0;
+// We want three packets before doing a bruteforce
+static struct raw_packet {
+  uint8_t  data[4];
+} bf_packets[3];
+
+
 
 // Simulated TX values
 static uint16_t g_TxTemperature;
@@ -76,6 +87,11 @@ static int8_t g_RxTemperature;
 static uint8_t g_RxFlags;
 static uint16_t g_RxWatts;
 static uint16_t g_RxWattHours;
+
+// Watt-hour counter rolls over every 65.536 kWh
+// This should be good for > 4 GWh; enough for everyone ...
+static unsigned long g_TotalRxWattHours;
+static uint16_t g_PrevRxWattHours;
 
 static bool g_RxDirty;
 static uint32_t g_RxLast;
@@ -198,90 +214,6 @@ static void printWireval(void)
   return crc >> 8;
 }
 
-#if defined(DPIN_OOK_TX)
-static void TxShortPulse(void)
-{
-  digitalWrite(DPIN_OOK_TX, HIGH);
-  delayMicroseconds(OOK_TX_SHORT);
-  digitalWrite(DPIN_OOK_TX, LOW);
-}
-
-static void TxRaw(uint8_t v)
-{
-  for (uint8_t i=0; i<8; ++i)
-  {
-    TxShortPulse();
-    if (v & 0x80)
-      delayMicroseconds(OOK_TX_SHORT);
-    else
-      delayMicroseconds(OOK_TX_LONG);
-    v <<= 1;
-  }
-}
-
-static void TxWireval(uint16_t txId)
-{
-  // CRC is calculated before txId is added which allows multiple transmitters
-  // as the transmitter the receiver isn't tracking will just see the other
-  // data is CRC errors
-  wireval.crc = crc8(wireval.data.raw, sizeof(wireval.data.raw));
-  wireval.data.val16 += txId;
-
-  printWireval();
-
-  // The header is 11111110 and a short duration pause
-  // Which will come out as SS SS SS SS SS SS SS SL*1.5
-  TxRaw(wireval.hdr);
-  delayMicroseconds(OOK_TX_SHORT);
-  TxRaw(wireval.data.raw[0]);
-  TxRaw(wireval.data.raw[1]);
-  TxRaw(wireval.crc);
-  // Packet ends with a short pulse otherwise there's no telling what the last
-  // bit value was
-  TxShortPulse();
-}
-
-static void TxIdOnce(uint16_t txId)
-{
-  // An ID packet is just one where the CRC is good before the ID
-  // is subtracted
-  wireval.data.val16 = txId;
-  TxWireval(0);
-}
-
-static void TxInstantOnce(uint16_t txId, uint16_t val)
-{
-  // last two bits are reserved for packet type
-  wireval.data.val16 = (val & 0xfffc) | OOK_PACKET_INSTANT;
-  TxWireval(txId);
-}
-
-static void TxTempOnce(uint16_t txId, uint8_t temp, uint8_t lowBat)
-{
-  Serial.print(F("Temperature "));
-  wireval.data.raw[0] = (lowBat << 7) | g_TxFlags | OOK_PACKET_TEMP;
-  wireval.data.raw[1] = temp;
-  TxWireval(txId);
-}
-
-static void TxTotalOnce(uint16_t txId, uint16_t val)
-{
-  Serial.print(F("Total "));
-  // last two bits are reserved for packet type
-  wireval.data.val16 = (val & 0xfffc) | OOK_PACKET_TOTAL;
-  TxWireval(txId);
-}
-
-static uint16_t wattsToCnt(uint16_t watts)
-{
-  return 3600000UL / watts;
-}
-
-static uint8_t tempFToCnt(float temp)
-{
-  return (temp + 28.63) / 0.823;
-}
-#endif // defined(DPIN_OOK_TX)
 
 static void setRF69FreqL(uint32_t khz)
 {
@@ -335,69 +267,109 @@ static void resetRf69(void)
 #endif // DPIN_RF69_RESET
 }
 
-static void handleCommand(void)
+/**
+ * Try to bruteforce the TX ID by using the last transmission
+ */
+static void bruteforce_txid(void) {
+  txid_bruteforce = false;
+  Serial.println(F("{ \"status\": \"bruteforcing TXID\"}"));
+  
+  uint8_t data[4];
+  
+  // Strategy: find a CRC that works for 1st packet, then try on 2nd, then try on 3rd
+  // We have an 8 bit CRC, so that's pretty fast
+  for (uint16_t txid = 0; txid < 0xffff; txid++) {
+    uint8_t crc_ok_count = 0;
+    for (uint8_t i = 0; i < 3; i++) {
+      uint16_t val16 = *(uint16_t *)bf_packets[i].data;
+      val16 -= txid;
+      data[0] = val16 & 0xff;
+      data[1] = val16 >> 8;
+      data[2] = bf_packets[i].data[2];
+      data[3] = bf_packets[i].data[3];
+      if (crc8(data, 3) == 0) {
+        crc_ok_count++;
+      }
+    }
+    if (crc_ok_count == 3) {
+        Serial.print(F("{ \"txid_candidate\": 0x"));
+        Serial.print(txid,16);
+        Serial.println('}');
+    }
+  }  
+}
+
+/**
+ * Process serial input.
+ * Capital commands are for settings
+ * Lowercase commands are for utilities
+ *
+ * p:           Dump settings
+ * d:0 or 1     Debug mode
+ * v:           Print version
+ * F:23.5       Set power factor
+ * X:ABCD      Set TX ID (hexa)
+ * x:           Bruteforce TX ID with next packets
+ * b:           Get battery state
+ */
+static void processInput(void)
 {
+  bool settings_changed = false;
+  float factor = 0;
+  uint16_t id = 0;
+  
+  if (input_buffer[1] != ':')
+    return;
   
   switch (input_buffer[0])
   {
   case 'b':
-    Serial.print(F("Batt"));
-    if (input_buffer[1] != '?')
-      g_TxLowBat = atoi(&input_buffer[1]);
-    Serial.println(g_TxLowBat, DEC);
-    g_TxCnt = 4; // force next packet is temperature
+    Serial.print(F("{ \"batt\": "));
+    Serial.print(g_TxLowBat, DEC);
+    Serial.println('}');
     break;
-  case 'f':
-    Serial.print(F("Flags"));
-    if (input_buffer[1] != '?')
-      g_TxFlags = atoi(&input_buffer[1]);
-    Serial.println(g_TxFlags, DEC);
-    g_TxCnt = 4; // force next packet is temperature
-    break;
-  case 'k':
-    Serial.print(F("TotalkW"));
-    if (input_buffer[1] != '?')
-      g_TxTotal = atoi(&input_buffer[1]);
-    Serial.println(g_TxTotal, DEC);
-    g_TxCnt = 5; // force next packet is total
-    break;
-  case 'q':
-    Serial.print(F("freQ"));
-    setRF69Freq(&input_buffer[1]);
-    break;
-  case 't':
-    Serial.print(F("Temp"));
-    if (input_buffer[1] != '?')
-      g_TxTemperature = atoi(&input_buffer[1]);
-    Serial.println(g_TxTemperature, DEC);
-    g_TxCnt = 4; // force next packet is temperature
-    break;
-  case 'w':
-    Serial.print(F("InstW"));
-    if (input_buffer[1] != '?')
-      g_TxWatts = atoi(&input_buffer[1]);
-    Serial.println(g_TxWatts, DEC);
-    g_TxCnt = 0; // force next packet is usage
-    break;
-  case 'x':
-    Serial.print(F("TxId"));
-    if (input_buffer[1] != '?')
-      settings.tx_id = atoi(&input_buffer[1]);
-    Serial.println(settings.tx_id, DEC);
-    break;
-  case 'z':
-    rf69ook_dumpRegs();
-    Serial.print(F("RX:")); Serial.println(digitalRead(DPIN_OOK_RX));
-    break;
-  case ']':
-    setRf69Thresh(g_RxOokFloor+4);
-    break;
-  case '[':
-    setRf69Thresh(g_RxOokFloor-4);
-    break;
-  case '*':
-    resetRf69();
-    break;
+  case 'd':
+     if (input_buffer[2] == '1')
+        debug = true;
+     else
+        debug = false;
+     break;
+   case 'v':
+     Serial.println(F("{ \"version\": \"$UCID,Powermon433,"__DATE__" "__TIME__"\"}"));
+     break;
+   case 'p':
+     Serial.print('{');
+     dtostre(settings.power_factor, float_buffer, 6, NULL);
+     sprintf_P(output_buffer, PSTR("\"power_factor\": %s, "), float_buffer);
+     Serial.print(output_buffer);
+     Serial.print(F("\"tx_id\": 0x")); Serial.print(settings.tx_id, HEX);
+     Serial.println('}');
+     break;
+    case 'F':
+      factor = atof(&input_buffer[2]);
+      if (settings.power_factor == factor)
+        break;
+      settings.power_factor = factor;
+      settings_changed = true;
+      break;
+    case 'X':
+      id = strtol(&input_buffer[2], NULL, 16);
+      if (id == settings.tx_id)
+        return;
+      settings.tx_id = id;
+      settings_changed = true;
+      break;
+    case 'x':
+       txid_bruteforce = true;
+       bf_idx = 0;
+       Serial.println(F("{ \"status\": \"attempt TXID bruteforce next packet\"}"));
+       break;
+      
+  }
+  
+  if (settings_changed) {
+    save_settings();
+    Serial.println(F("{ \"settings\": \"saved\" }"));
   }
 }
 
@@ -409,7 +381,7 @@ static void serial_doWork(void)
     input_buffer[input_buffer_index] = Serial.read();
     if (input_buffer[input_buffer_index] == '\n') {
       input_buffer[input_buffer_index] = 0;
-      handleCommand();
+      processInput();
       input_buffer_index = 0;
     } else 
       input_buffer_index = (input_buffer_index+1)%INPUT_BUFFER_SIZE;
@@ -517,7 +489,10 @@ static void decodePowermon(uint16_t val16)
     break;
 
   case OOK_PACKET_TOTAL:
+    g_PrevRxWattHours = g_RxWattHours;
     g_RxWattHours = val16;
+    // prevent rollover through the power of unsigned arithmetic
+    g_TotalRxWattHours += (g_RxWattHours - g_PrevRxWattHours);
     break;
   }
 }
@@ -549,10 +524,10 @@ static void decodeRxPacket(void)
   if (crc8(decoder.data, 3) == 0)
   {
     settings.tx_id = decoder.data[1] << 8 | decoder.data[0];
-    Serial.print(F("NEW DEVICE id="));
+    save_settings(); // Preserve to EEPROM
+    Serial.print(F("{ \"device_id\": "));
     Serial.print(val16, HEX);
-    printRssi();
-    Serial.println();
+    Serial.println('}');
     return;
   }
 
@@ -568,9 +543,16 @@ static void decodeRxPacket(void)
   }
   else
   {
-    Serial.print(F("CRC ERR"));
-    printRssi();
-    Serial.println();
+    Serial.println(F("{ \"error\": \"CRC\"}"));
+    if (txid_bruteforce && ( bf_idx < 3)) {
+      val16 += settings.tx_id;
+      bf_packets[bf_idx].data[0] = val16 & 0xff;
+      bf_packets[bf_idx].data[1] = val16 >> 8;
+      bf_packets[bf_idx].data[2] = decoder.data[2];
+      bf_packets[bf_idx++].data[3] = decoder.data[3];
+      if (bf_idx == 3)
+        bruteforce_txid();
+    }
   }
 }
 
@@ -596,45 +578,6 @@ static void rxSetup(void)
 #endif
 }
 
-static void ookTx(void)
-{
-#if defined(DPIN_OOK_TX)
-  static uint32_t g_LastTx;
-
-  if (digitalReadFast(DPIN_STARTTX_BUTTON) == LOW)
-  {
-    for (uint8_t i=0; i<4; ++i)
-    {
-      TxIdOnce(settings.tx_id);
-      delay(OOK_ID_DELAY);
-    }
-
-    g_LastTx = millis();
-  }
-
-  if (g_LastTx != 0 && millis() - g_LastTx > 30500)
-  {
-    digitalWrite(DPIN_LED, HIGH);
-    for (uint8_t i=0; i<3; ++i)
-    {
-      if (i == 2 || (g_TxCnt >= 0 && g_TxCnt < 4))
-        TxInstantOnce(settings.tx_id, wattsToCnt(g_TxWatts));
-      else if (g_TxCnt == 4)
-        TxTempOnce(settings.tx_id, g_TxTemperature, g_TxLowBat);
-      else if (g_TxCnt == 5)
-        TxTotalOnce(settings.tx_id, g_TxTotal);
-      delay(OOK_TX_DELAY);
-    }
-
-    ++g_TxCnt;
-    if (g_TxCnt > 5)
-      g_TxCnt = 0;
-
-    digitalWrite(DPIN_LED, LOW);
-    g_LastTx = millis();
-  }
-#endif //defined(DPIN_OOK_TX)
-}
 
 static void ookRx(void)
 {
@@ -656,10 +599,12 @@ static void ookRx(void)
   // If it has been more than 250ms since the last receive, dump the data
   if (g_RxDirty && (millis() - g_RxLast) > 250U)
   {
- #if defined(DUMP_RX)
-   Serial.print("{ \"uptime\":"); Serial.print(millis(), DEC); Serial.print('}');
-#endif
-    Serial.print(F("{ \"energy\": ")); Serial.print(g_RxWattHours, DEC);
+    if (debug) {
+      Serial.print("{ \"uptime\":"); Serial.print(millis(), DEC); Serial.print(',');
+    } else {
+      Serial.print('{');
+    }
+    Serial.print(F(" \"energy\": ")); Serial.print(g_TotalRxWattHours, DEC);
     Serial.print(F(", \"p_raw\": ")); Serial.print(g_RxWatts, DEC);
     Serial.print(F(", \"power\": ")); Serial.print(g_RxWatts*settings.power_factor, DEC);
     Serial.print(F(", \"temp\": ")); Serial.print(g_RxTemperature, DEC);
@@ -714,6 +659,7 @@ static void load_settings() {
      settings.magic = SETTINGS_MAGIC;
      settings.tx_id = DEFAULT_TX_ID;
      settings.power_factor = 6;
+     settings.debug = false;
 
      save_settings();
      
@@ -731,6 +677,7 @@ void setup() {
   Serial.println(F("{ \"version\": \"$UCID,Powermon433,"__DATE__" "__TIME__"\"}"));
 
   pinMode(DPIN_LED, OUTPUT);
+  
   if (rf69ook_init())
   {
     Serial.println(F("RF69 initialized"));
@@ -739,13 +686,13 @@ void setup() {
 
   txSetup();
   rxSetup();
-
+  g_TotalRxWattHours = 0;
   load_settings();
 }
 
 void loop()
 {
-  ookTx();
+//  ookTx();
   ookRx();
   serial_doWork();
 }

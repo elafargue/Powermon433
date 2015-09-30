@@ -57,6 +57,7 @@ typedef struct {
   
   float power_factor;             // The power meter power factor
   uint16_t tx_id;
+  bool debug;
   
 } settings_t;
 
